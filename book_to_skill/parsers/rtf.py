@@ -1,3 +1,4 @@
+import codecs
 import html
 import re
 import sys
@@ -10,6 +11,8 @@ from book_to_skill.exceptions import ExtractionError
 # or a literal "?". Assumes the default \uc1 (one fallback char); \ucN directives
 # and multi-char/group fallbacks are not parsed (best-effort fallback only).
 _RTF_UNICODE = re.compile(r"\\u(-?\d+)[ ]?(?:\\'[0-9a-fA-F]{2}|\?)?")
+_RTF_HEX_RUN = re.compile(r"(?:\\'[0-9a-fA-F]{2})+")
+_RTF_ANSI_CODEPAGE = re.compile(r"\\ansicpg(\d+)")
 
 
 def _rtf_unicode_repl(match: re.Match) -> str:
@@ -17,6 +20,53 @@ def _rtf_unicode_repl(match: re.Match) -> str:
     if cp == 0 or 0xD800 <= cp <= 0xDFFF:   # NUL and lone surrogates: unwanted in text
         return ""
     return chr(cp)
+
+
+def _decode_rtf_unicode(raw: str) -> str:
+    """Combine adjacent UTF-16 surrogate escapes before dropping lone halves."""
+    out: list[str] = []
+    cursor = 0
+    escapes = iter(_RTF_UNICODE.finditer(raw))
+    match = next(escapes, None)
+    while match is not None:
+        out.append(raw[cursor:match.start()])
+        high = int(match.group(1)) % 0x10000
+        following = next(escapes, None)
+        if (
+            0xD800 <= high <= 0xDBFF
+            and following is not None
+            and following.start() == match.end()
+        ):
+            low = int(following.group(1)) % 0x10000
+            if 0xDC00 <= low <= 0xDFFF:
+                out.append(chr(0x10000 + (high - 0xD800) * 0x400 + low - 0xDC00))
+                cursor = following.end()
+                match = next(escapes, None)
+                continue
+        out.append(_rtf_unicode_repl(match))
+        cursor = match.end()
+        match = following
+    out.append(raw[cursor:])
+    return "".join(out)
+
+
+def _rtf_ansi_encoding(raw: str) -> str:
+    """Return the declared ANSI code page, defaulting to Windows-1252."""
+    match = _RTF_ANSI_CODEPAGE.search(raw)
+    encoding = f"cp{match.group(1)}" if match else "cp1252"
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return "cp1252"
+    return encoding
+
+
+def _decode_hex_run(match: re.Match, encoding: str) -> str:
+    payload = bytes(
+        int(value, 16)
+        for value in re.findall(r"[0-9a-fA-F]{2}", match.group(0))
+    )
+    return payload.decode(encoding, errors="replace")
 
 
 # RTF groups whose contents are metadata or formatting tables rather than
@@ -109,19 +159,37 @@ def strip_rtf_fallback(raw: str) -> str:
     # the control-word cleanup that would otherwise strip the markup and leave
     # the names behind as if they were prose.
     raw = _strip_destination_groups(raw)
-    raw = _RTF_UNICODE.sub(_rtf_unicode_repl, raw)   # decode \uN escapes first
-    raw = re.sub(r"\\'[0-9a-fA-F]{2}", " ", raw)
-    raw = re.sub(r"\\par[d]?", "\n", raw)
-    raw = re.sub(r"\\tab", "\t", raw)
-    # Park the three escaped literals ("\\", "\{", "\}") on placeholders before
-    # the sweeps below, which would otherwise strip the backslash as a control
-    # symbol and then delete the brace along with the real group delimiters —
-    # leaving a stray "\" where the book said "{a, b}". Longest escape first.
+    # Park escaped literals before ANY control processing: the second slash in
+    # "\\\\u945?" or "\\\\tab" belongs to displayed text, not an active control.
+    # Do this after destination scanning, which needs the original braces and
+    # escapes to identify whole non-content groups. Longest escape first.
     raw = (
         raw.replace("\\\\", "\x01")
         .replace("\\{", "\x02")
         .replace("\\}", "\x03")
     )
+    ansi_encoding = _rtf_ansi_encoding(raw)
+    raw = _decode_rtf_unicode(raw)   # decode \uN escapes first
+    # A hex byte immediately following \uN is its compatibility fallback and
+    # was consumed by _RTF_UNICODE above. Any remaining \'hh escapes are actual
+    # document text. Decode adjacent bytes as a run so multibyte code pages work.
+    raw = _RTF_HEX_RUN.sub(
+        lambda match: _decode_hex_run(match, ansi_encoding), raw
+    )
+    # \line is a required line break; do not match longer control words such
+    # as \linebetcol. A single following space is an RTF delimiter, not text.
+    raw = re.sub(r"\\line(?![a-zA-Z])(?:-?\d+)? ?", "\n", raw)
+    # Keep \pard's existing handling separate: the \par matcher must not treat
+    # it (or longer words such as Word's \pararsidN revision id) as a break.
+    raw = re.sub(r"\\pard", "\n", raw)
+    # Like \line, \par may have a signed numeric parameter and consumes one
+    # delimiter space. Require a delimiter after that parameter as well.
+    raw = re.sub(
+        r"\\par(?![a-zA-Z])(?:-?\d+)?(?![a-zA-Z0-9]) ?",
+        "\n",
+        raw,
+    )
+    raw = re.sub(r"\\tab", "\t", raw)
     raw = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", raw)
     raw = raw.replace("{", "").replace("}", "")
     raw = raw.replace("\x01", "\\").replace("\x02", "{").replace("\x03", "}")
@@ -139,6 +207,7 @@ def extract_rtf(rtf_path: str) -> tuple[str, str]:
         if text.strip():
             return text, "striprtf"
     except ImportError:
+        # striprtf is optional; fall back to the built-in regex RTF stripper below.
         pass
     except Exception as e:
         print(f"  [warn] extract_rtf/striprtf failed: {type(e).__name__}: {e}", file=sys.stderr)

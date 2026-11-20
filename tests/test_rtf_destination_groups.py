@@ -55,8 +55,7 @@ class TestDestinationGroupsDropped:
         assert "Real body text here." in out
 
     def test_chapter_heading_is_on_its_own_line(self):
-        lines = [ln for ln in strip_rtf_fallback(FULL_HEADER_RTF).splitlines()
-                 if ln.strip()]
+        lines = list(filter(str.strip, strip_rtf_fallback(FULL_HEADER_RTF).splitlines()))
         assert lines[0].strip() == "Chapter 1"
 
     def test_info_metadata_not_exposed(self):
@@ -134,6 +133,24 @@ class TestExistingBehaviourPreserved:
         out = strip_rtf_fallback(r"{\rtf1 a\par b\tab c}")
         assert "\n" in out
         assert "\t" in out
+
+
+class TestHexEscapedText:
+    """Standalone RTF hex bytes are text, not Unicode fallback bytes."""
+
+    def test_default_ansi_hex_escape_decodes_cp1252(self):
+        out = strip_rtf_fallback(r"{\rtf1\ansi caf\'e9 and \'93quoted\'94.}")
+        assert out == "café and “quoted”."
+
+    def test_declared_code_page_decodes_consecutive_bytes(self):
+        escaped = "".join(f"\\'{byte:02x}" for byte in "Привет".encode("cp1251"))
+        out = strip_rtf_fallback(r"{\rtf1\ansi\ansicpg1251 " + escaped + "}")
+        assert out == "Привет"
+
+    def test_declared_multibyte_code_page_decodes_each_run_together(self):
+        escaped = "".join(f"\\'{byte:02x}" for byte in "日本".encode("cp932"))
+        out = strip_rtf_fallback(r"{\rtf1\ansi\ansicpg932 " + escaped + "}")
+        assert out == "日本"
 
 
 class TestMalformedInputIsNotTruncated:

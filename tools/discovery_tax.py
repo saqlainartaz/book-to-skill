@@ -33,16 +33,27 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+
+# Keep a deployed skill directory clean: importing the package below would
+# otherwise write __pycache__/*.pyc beside the sources, leaving build artifacts
+# inside the skill. `__name__` is bound before the module body runs, so this
+# holds for a direct invocation and never mutates an embedding process that
+# merely imports this module. Must be set BEFORE `book_to_skill` is imported.
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
 from pathlib import Path
 
 # Reuse the extractor's hardened chapter detection instead of duplicating it, so
 # discovery_tax and the pipeline always agree on what a chapter is (Arabic +
 # Roman headings, prose/cross-reference rejection, list-item rejection).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from book_to_skill.utils import _chapter_number as chapter_number  # noqa: E402
-
-TOC_RE = re.compile(r"^\s*(?:sum[áa]rio|table of contents|contents|[íi]ndice)\s*$",
-                    re.IGNORECASE | re.MULTILINE)
+# Reuse the extractor's ToC detection too (multilingual + CJK), so discovery_tax
+# and the pipeline agree on what a ToC is — the stale local regex here only
+# matched EN/ES/PT and silently missed FR/DE/IT/NL/CJK books.
+from book_to_skill.utils import (  # noqa: E402
+    _chapter_number as chapter_number,
+    _TOC_PATTERN as toc_pattern,
+)
 
 
 def count_tokens(text: str) -> int:
@@ -90,7 +101,7 @@ def best_chapter(chapters: list[tuple[int | None, str, str]], n: int,
 
 def extract_toc(front_matter: str) -> str:
     """Best-effort slice of the ToC block from the front matter."""
-    m = TOC_RE.search(front_matter)
+    m = toc_pattern.search(front_matter)
     if not m:
         # No explicit ToC: assume the agent skims the whole front matter.
         return front_matter

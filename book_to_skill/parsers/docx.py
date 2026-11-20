@@ -1,29 +1,79 @@
 from __future__ import annotations
 
+from collections import Counter
 import zipfile
 import sys
 from book_to_skill.exceptions import ExtractionError
 
 
+def _docx_inline_text(elem, *, paragraph_boundaries: bool = False) -> str:
+    """Rebuild text runs without dropping explicit DOCX separators."""
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    text_parts: list[str] = []
+    seen_paragraph = False
+    for node in elem.iter():
+        if paragraph_boundaries and node.tag == f"{ns}p":
+            if seen_paragraph:
+                text_parts.append("\n")
+            seen_paragraph = True
+        elif node.tag == f"{ns}t" and node.text:
+            text_parts.append(node.text)
+        elif node.tag == f"{ns}tab":
+            text_parts.append("\t")
+        elif node.tag in {f"{ns}br", f"{ns}cr"}:
+            text_parts.append("\n")
+    return "".join(text_parts)
+
+
 def extract_docx_with_python_docx(docx_path: str) -> str | None:
+    # Called unconditionally (not just via extract_docx()) so this function is
+    # self-defending when invoked directly WITH python-docx installed:
+    # raises ExtractionError on DOCTYPE/ENTITY declarations before
+    # python-docx ever opens the archive. If python-docx is NOT installed,
+    # this returns None without validating at all -- a parser that isn't
+    # installed parses nothing, so skipping the scan gives up no safety
+    # (nothing gets extracted, malicious or not), and it avoids paying the
+    # full archive scan on every extract_docx() call in the (default,
+    # stdlib-only) case where this parser never even runs. A caller that
+    # invokes this function directly and needs a validation guarantee
+    # regardless of python-docx's availability should use
+    # extract_docx_with_zipfile() or call validate_docx_xml_safety() itself.
     try:
         import docx
+        validate_docx_xml_safety(docx_path)
         document = docx.Document(docx_path)
-        parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
-        for table in document.tables:
-            for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
-                if any(cells):
-                    parts.append("\t".join(cells))
+        iter_inner_content = getattr(document, "iter_inner_content", None)
+        if not callable(iter_inner_content):
+            # Older python-docx releases lack the ordered block iterator. Let
+            # extract_docx() use its order-preserving stdlib fallback instead.
+            return None
+        parts = []
+        for block in iter_inner_content():
+            if hasattr(block, "rows"):
+                for row in block.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        parts.append("\t".join(cells))
+            elif hasattr(block, "text") and block.text:
+                parts.append(block.text)
         return "\n".join(parts)
     except ImportError:
         return None
+    except ExtractionError:
+        # Without this, the broad `except Exception` below would catch an
+        # XXE rejection from validate_docx_xml_safety() too, turning a
+        # security refusal into a swallowed [warn] + None.
+        raise
     except Exception as e:
         print(f"  [warn] extract_docx_with_python_docx failed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 
 def extract_docx_with_zipfile(docx_path: str) -> str | None:
+    # Called unconditionally (not just via extract_docx()) so this function is
+    # self-defending even when invoked directly: raises ExtractionError on
+    # DOCTYPE/ENTITY declarations before the XML ever reaches the parser.
+    validate_docx_xml_safety(docx_path)
     try:
         import xml.etree.ElementTree as ET
 
@@ -40,21 +90,20 @@ def extract_docx_with_zipfile(docx_path: str) -> str | None:
             # tables last). Unknown wrappers (e.g. <w:sdt> content controls) are
             # recursed into so their paragraphs/tables are not lost; <w:p> and
             # <w:tbl> are NOT recursed into, so table-cell paragraphs are not
-            # double-counted. Cell text concatenates the cell's runs; nested
-            # tables fold into the parent cell and are also emitted standalone
+            # double-counted. Cell text joins runs and separates paragraphs;
+            # nested tables fold into the parent cell and are also emitted standalone
             # (rare; best-effort).
             for child in elem:
                 tag = child.tag
                 if tag == f"{ns}p":
-                    texts = [t.text for t in child.iter(f"{ns}t") if t.text]
-                    if texts:
-                        parts.append("".join(texts))
+                    paragraph = _docx_inline_text(child)
+                    if paragraph:
+                        parts.append(paragraph)
                 elif tag == f"{ns}tbl":
                     for row in child.iter(f"{ns}tr"):
                         cells = []
                         for cell in row.iter(f"{ns}tc"):
-                            cell_texts = [t.text for t in cell.iter(f"{ns}t") if t.text]
-                            cells.append("".join(cell_texts).strip())
+                            cells.append(_docx_inline_text(cell, paragraph_boundaries=True).strip())
                         if any(cells):
                             parts.append("\t".join(cells))
                 else:
@@ -92,12 +141,73 @@ def validate_docx_xml_safety(docx_path: str) -> None:
         raise ExtractionError(f"Error during security validation of DOCX archive: {e}")
 
 
+def _docx_sdt_text_fragments(docx_path: str) -> list[str] | None:
+    """Return non-empty paragraph text inside content controls.
+
+    This is called only after the preferred parser has validated the archive.
+    If the document XML cannot be inspected, let the caller try the stdlib
+    parser as a best-effort fallback and compare output lengths.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        with zipfile.ZipFile(docx_path) as zf:
+            root = ET.fromstring(zf.read("word/document.xml"))
+    except (KeyError, OSError, zipfile.BadZipFile, ET.ParseError):
+        return None
+
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    fragments: list[str] = []
+    seen_paragraphs: set[int] = set()
+    for sdt in root.iter(f"{ns}sdt"):
+        for content in sdt.iter(f"{ns}sdtContent"):
+            for paragraph in content.iter(f"{ns}p"):
+                paragraph_id = id(paragraph)
+                if paragraph_id in seen_paragraphs:
+                    continue
+                seen_paragraphs.add(paragraph_id)
+                if text := _docx_inline_text(paragraph).strip():
+                    fragments.append(text)
+    return fragments
+
+
+def _sdt_coverage(text: str, fragments: list[str]) -> int:
+    """Score matching normalized paragraph occurrences in parser output."""
+    output_paragraphs = Counter(
+        normalized
+        for line in text.splitlines()
+        if (normalized := " ".join(line.split()))
+    )
+    fragment_counts = Counter(" ".join(fragment.split()) for fragment in fragments)
+    return sum(
+        len(fragment) * min(count, output_paragraphs[fragment])
+        for fragment, count in fragment_counts.items()
+    )
+
+
 def extract_docx(docx_path: str) -> tuple[str, str]:
-    validate_docx_xml_safety(docx_path)
+    # Validation lives in each leaf parser (extract_docx_with_python_docx,
+    # extract_docx_with_zipfile) so it runs exactly once regardless of which
+    # parser actually handles the file, instead of once here plus again in
+    # whichever parser this falls through to.
     print("Trying python-docx...", end=" ", flush=True)
     text = extract_docx_with_python_docx(docx_path)
     if text and text.strip():
-        print("OK")
+        sdt_fragments = _docx_sdt_text_fragments(docx_path)
+        if sdt_fragments is None or sdt_fragments:
+            print("OK; SDT content control detected")
+            print("Trying stdlib DOCX parser...", end=" ", flush=True)
+            fallback_text = extract_docx_with_zipfile(docx_path)
+            if fallback_text and (
+                (_sdt_coverage(fallback_text, sdt_fragments) > _sdt_coverage(text, sdt_fragments))
+                if sdt_fragments is not None
+                else len(fallback_text.strip()) > len(text.strip())
+            ):
+                print("OK (more complete output)")
+                return fallback_text, "zipfile-docx"
+            print("keeping python-docx result")
+        else:
+            print("OK")
         return text, "python-docx"
 
     print("not available")

@@ -1,6 +1,5 @@
 ---
-description: "Turn any book, PDF or EPUB into a structured agent skill for Claude Code, GitHub Copilot CLI and Amp. Named frameworks and decision rules, loaded on demand."
-seo_title: "book-to-skill - Turn Any Book Into an AI Agent Skill"
+description: "Turn any book, PDF or EPUB into a structured agent skill for Claude Code, GitHub Copilot CLI, Amp, Codex, Hermes Agent, OpenCode, and OpenClaw. Named frameworks and decision rules, loaded on demand."seo_title: "book-to-skill - Turn Any Book Into an AI Agent Skill"
 hide:
   - navigation
   - toc
@@ -13,8 +12,7 @@ hide:
   "name": "book-to-skill",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS, Windows",
-  "description": "Converts books and documents (PDF, EPUB, DOCX, HTML, Markdown, RTF, MOBI/AZW) into structured, on-demand agent skills for Claude Code, GitHub Copilot CLI and Amp.",
-  "url": "https://booktoskill.is-a.dev/",
+"description": "Converts books and documents (PDF, EPUB, DOCX, HTML, Markdown, RTF, MOBI/AZW) into structured, on-demand agent skills for Claude Code, GitHub Copilot CLI, Amp, Codex, Hermes Agent, OpenCode, and OpenClaw.",  "url": "https://booktoskill.is-a.dev/",
   "codeRepository": "https://github.com/virgiliojr94/book-to-skill",
   "license": "https://opensource.org/licenses/MIT",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -63,16 +61,16 @@ Turn any book or document into a structured, on-demand agent skill — named fra
 
     ---
 
-    One `SKILL.md` runs on Claude Code, GitHub Copilot CLI, and Amp through the
-    open Agent Skills standard.
+One `SKILL.md` runs on Claude Code, GitHub Copilot CLI, Amp, Codex, Hermes Agent, OpenCode, and OpenClaw through the open Agent Skills standard.
 
 </div>
 
 ## Install
 
-**As an agent skill** (gives you the `/book-to-skill` command in Claude Code, Copilot CLI, Amp):
-
+**As an agent skill** (gives you the `/book-to-skill` command in Claude Code, Copilot CLI, Amp, Codex, Hermes Agent, OpenCode, or OpenClaw):
 ```bash
+npx skills add virgiliojr94/book-to-skill
+# or manually:
 git clone https://github.com/virgiliojr94/book-to-skill.git ~/.claude/skills/book-to-skill
 # then, in your agent session:
 /book-to-skill /path/to/book.pdf [skill-name]
@@ -81,7 +79,8 @@ git clone https://github.com/virgiliojr94/book-to-skill.git ~/.claude/skills/boo
 **As a standalone CLI** (just the text extractor, optional):
 
 ```bash
-pip install "book-to-skill[pdf,epub,docx]"
+# not on PyPI yet — pip takes it from the repository
+pip install "book-to-skill[pdf,epub,docx] @ git+https://github.com/virgiliojr94/book-to-skill.git"
 book-to-skill /path/to/book.pdf --mode text
 ```
 

@@ -12,6 +12,7 @@ import json
 import sys
 import textwrap
 import zipfile
+from itertools import starmap
 from pathlib import Path
 from unittest import mock
 
@@ -38,7 +39,7 @@ from book_to_skill.parsers import pdf as pdf_parser
 from book_to_skill.parsers.text import read_text_file
 from book_to_skill.parsers.docx import extract_docx_with_zipfile
 from book_to_skill.parsers.rtf import strip_rtf_fallback
-from book_to_skill.parsers.epub import extract_with_zipfile
+from book_to_skill.parsers.epub import count_epub_chapters, extract_with_zipfile
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -208,10 +209,7 @@ class TestEpubExtractionFix:
 
         # Even if ebooklib is absent, this should NOT raise TypeError/ValueError
         with mock.patch("book_to_skill.utils.prepare_dependencies"):
-            try:
-                result = extract_single_file(epub_path, "text", "no")
-            except (TypeError, ValueError) as exc:
-                pytest.fail(f"Tuple-unpack regression! Got: {exc}")
+            result = extract_single_file(epub_path, "text", "no")
 
         assert result["text"]  # some text was extracted
 
@@ -285,14 +283,16 @@ class TestBatchResilience:
     def test_extract_single_file_raises_on_missing(self, tmp_path):
         """A missing file should raise ExtractionError, not sys.exit."""
         missing = tmp_path / "does_not_exist.txt"
-        with pytest.raises(ExtractionError, match="File not found"):
+        with pytest.raises(ExtractionError) as exc_info:
             extract_single_file(missing, "text", "no")
+        assert exc_info.match("File not found")
 
     def test_extract_single_file_raises_on_unsupported(self, tmp_path):
         """An unsupported format should raise ExtractionError, not sys.exit."""
         unsupported = _make_unsupported_file(tmp_path / "data.xyz")
-        with pytest.raises(ExtractionError, match="Unsupported format"):
+        with pytest.raises(ExtractionError) as exc_info:
             extract_single_file(unsupported, "text", "no")
+        assert exc_info.match("Unsupported format")
 
     def test_batch_continues_past_bad_files(self, tmp_path):
         """A mix of good + bad files should produce output for the good ones."""
@@ -301,18 +301,17 @@ class TestBatchResilience:
         # Create a file that will fail (unsupported extension, garbage bytes)
         bad_file = _make_unsupported_file(tmp_path / "bad.xyz")
 
-        # Simulate the batch loop from main()
-        input_files = [good_file, bad_file]
         extracted = []
         errors = []
 
-        for fp in input_files:
-            try:
-                with mock.patch("book_to_skill.utils.prepare_dependencies"):
-                    res = extract_single_file(fp, "text", "no")
-                extracted.append(res)
-            except ExtractionError as exc:
-                errors.append((fp, str(exc)))
+        with mock.patch("book_to_skill.utils.prepare_dependencies"):
+            extracted.append(extract_single_file(good_file, "text", "no"))
+
+        try:
+            with mock.patch("book_to_skill.utils.prepare_dependencies"):
+                extract_single_file(bad_file, "text", "no")
+        except ExtractionError as exc:
+            errors.append((bad_file, str(exc)))
 
         assert len(extracted) == 1, "Good file should have been extracted"
         assert len(errors) == 1, "Bad file should have been recorded as error"
@@ -600,9 +599,12 @@ class TestDetectStructure:
         `The Art of War` (#132) is one: 13 such headings, 0 detected, while two
         footnote cross-references (`ch. 71.]`) were picked up instead.
         """
-        text = "\n".join(
-            "Chapter %s. Section\nBody text here." % r
-            for r in ("I", "II", "III", "IV", "V")
+        text = (
+            "Chapter I. Section\nBody text here.\n"
+            "Chapter II. Section\nBody text here.\n"
+            "Chapter III. Section\nBody text here.\n"
+            "Chapter IV. Section\nBody text here.\n"
+            "Chapter V. Section\nBody text here."
         )
         assert detect_structure(text)["chapters_detected"] == 5
 
@@ -626,6 +628,395 @@ class TestDetectStructure:
 
         assert _chapter_number("บทความนี้ยาวมากและมีรายละเอียดเยอะ") is None
         assert _chapter_number("ตอนนี้เรามาดูกันว่าเกิดอะไรขึ้น") is None
+
+    # ── Hindi (Devanagari) chapter headings ────────────────────────────────
+    def test_detects_hindi_chapters(self):
+        """Hindi headings: `अध्याय N`, with Devanagari or Arabic digits."""
+        text = (
+            "अध्याय १ प्रस्तावना\nसामग्री\n"
+            "अध्याय २ विधियाँ\nसामग्री\n"
+            "अध्याय 3 परिणाम\nसामग्री"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_hindi_markdown_prefix(self):
+        text = "## अध्याय १ पहला\nसामग्री\n## अध्याय २ दूसरा\nसामग्री"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_hindi_prose_is_not_a_chapter_heading(self):
+        """`अध्याय` used in prose (no number, or not at the start) is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("इस अध्याय में हम चर्चा करेंगे") is None
+        assert _chapter_number("अध्याय") is None
+
+    def test_detects_bengali_chapters(self):
+        """Bengali headings: `অধ্যায় N`, with Bengali or Arabic digits."""
+        text = (
+            "অধ্যায় ১ ভূমিকা\nবিষয়বস্তু\n"
+            "অধ্যায় ২ পদ্ধতি\nবিষয়বস্তু\n"
+            "অধ্যায় 3 ফলাফল\nবিষয়বস্তু"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_bengali_markdown_prefix(self):
+        text = "## অধ্যায় ১ প্রথম\nবিষয়বস্তু\n## অধ্যায় ২ দ্বিতীয়\nবিষয়বস্তু"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_bengali_prose_is_not_a_chapter_heading(self):
+        """`অধ্যায়` used in prose (no number, or not at the start) is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("এই অধ্যায়ে আমরা আলোচনা করব") is None
+        assert _chapter_number("অধ্যায়") is None
+
+    def test_detects_odia_chapters(self):
+        """Odia headings: `ଅଧ୍ୟାୟ N`, Odia or Arabic digits."""
+        text = (
+            "ଅଧ୍ୟାୟ ୧ ପରିଚୟ\nସାରାଂଶ\n"
+            "ଅଧ୍ୟାୟ ୨ ପଦ୍ଧତି\nସାରାଂଶ\n"
+            "ଅଧ୍ୟାୟ 3 ଫଳାଫଳ\nସାରାଂଶ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_odia_markdown_prefix(self):
+        text = "## ଅଧ୍ୟାୟ ୧ ପ୍ରଥମ\nସାରାଂଶ\n## ଅଧ୍ୟାୟ ୨ ଦ୍ୱିତୀୟ\nସାରାଂଶ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_odia_prose_is_not_a_chapter_heading(self):
+        """An inflected form (ଅଧ୍ୟାୟରେ) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ଏହି ଅଧ୍ୟାୟରେ ଆମେ ଆଲୋଚନା କରିବା") is None
+        assert _chapter_number("ଅଧ୍ୟାୟ") is None
+
+    def test_odia_does_not_collide_with_bengali(self):
+        """Odia ଅଧ୍ୟାୟ (U+0B05…) and Bengali অধ্যায় (U+0985…) are distinct."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ଅଧ୍ୟାୟ ୫") == 5
+        assert _chapter_number("অধ্যায় ৫") == 5
+
+    def test_detects_tamil_chapters(self):
+        """Tamil headings: `அத்தியாயம் N`, with Tamil or Arabic digits."""
+        text = (
+            "அத்தியாயம் ௧ முன்னுரை\nஉள்ளடக்கம்\n"
+            "அத்தியாயம் ௨ முறைகள்\nஉள்ளடக்கம்\n"
+            "அத்தியாயம் 3 முடிவுகள்\nஉள்ளடக்கம்"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_tamil_markdown_prefix(self):
+        text = "## அத்தியாயம் ௧ முதல்\nஉள்ளடக்கம்\n## அத்தியாயம் ௨ இரண்டாம்\nஉள்ளடக்கம்"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_tamil_prose_is_not_a_chapter_heading(self):
+        """An inflected form (அத்தியாயத்தில்) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("இந்த அத்தியாயத்தில் நாம் பார்ப்போம்") is None
+        assert _chapter_number("அத்தியாயம்") is None
+
+    def test_detects_sinhala_chapters(self):
+        """Sinhala headings: `පරිච්ඡේදය N`, Arabic or Sinhala Lith digits."""
+        text = (
+            "පරිච්ඡේදය 1 හැඳින්වීම\nසාරාංශය\n"
+            "පරිච්ඡේදය ෨ ක්‍රම\nසාරාංශය\n"
+            "පරිච්ඡේදය 3 ප්‍රතිඵල\nසාරාංශය"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_sinhala_markdown_prefix(self):
+        text = "## පරිච්ඡේදය 1 පළමු\nසාරාංශය\n## පරිච්ඡේදය 2 දෙවන\nසාරාංශය"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_sinhala_prose_is_not_a_chapter_heading(self):
+        """Inflected forms (පරිච්ඡේදයේ / පරිච්ඡේදයක්) and the bare word are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("මෙම පරිච්ඡේදයේ අපි සාකච්ඡා කරමු") is None
+        assert _chapter_number("තවත් පරිච්ඡේදයක් ඇත") is None
+        assert _chapter_number("පරිච්ඡේදය") is None
+
+    def test_detects_sinhala_adhyaya_chapters(self):
+        """The Sanskrit-loan word අධ්‍යාය is also a Sinhala chapter heading."""
+        text = (
+            "අධ්\u200dයාය 1 හැඳින්වීම\nසාරාංශය\n"
+            "අධ්\u200dයාය ෨ ක්‍රම\nසාරාංශය\n"
+            "අධ්\u200dයාය 3 ප්‍රතිඵල\nසාරාංශය"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_sinhala_adhyaya_matches_with_and_without_the_joiner(self):
+        """The ZWJ is optional: sanitization strips it before detection.
+
+        sanitize_extracted_text() removes U+200D, so the spelling that reaches
+        the matcher has no joiner even though every real source file has one.
+        Both forms must resolve.
+        """
+        from book_to_skill.sanitize import sanitize_extracted_text
+        from book_to_skill.utils import _chapter_number
+
+        with_joiner = "අධ්\u200dයාය 7"
+        sanitized, removed = sanitize_extracted_text(with_joiner)
+        assert removed == 1
+        assert sanitized == "අධ්යාය 7"
+        assert _chapter_number(with_joiner) == 7
+        assert _chapter_number(sanitized) == 7
+
+    def test_sinhala_adhyaya_prose_is_not_a_chapter_heading(self):
+        """Inflected forms and the bare word are not headings, joiner or not."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("මෙම අධ්\u200dයායේ අපි සාකච්ඡා කරමු") is None
+        assert _chapter_number("තවත් අධ්\u200dයායක් ඇත") is None
+        assert _chapter_number("අධ්\u200dයාය") is None
+        assert _chapter_number("අධ්යාය") is None
+
+    def test_sinhala_adhyaya_does_not_collide_with_other_indic_scripts(self):
+        """අධ්‍යාය shares a transliteration with four other scripts, not a block."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("අධ්\u200dයාය ෫") == 5
+        assert _chapter_number("अध्याय ५") == 5
+        assert _chapter_number("અધ્યાય ૫") == 5
+        assert _chapter_number("ਅਧਿਆਇ ੫") == 5
+
+    def test_detects_telugu_chapters(self):
+        """Telugu headings: both spellings (అధ్యాయము/అధ్యాయం), Telugu or Arabic digits."""
+        text = (
+            "అధ్యాయము ౧ పరిచయం\nసారాంశం\n"
+            "అధ్యాయం ౨ పద్ధతులు\nసారాంశం\n"
+            "అధ్యాయం 3 ఫలితాలు\nసారాంశం"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_telugu_markdown_prefix(self):
+        text = "## అధ్యాయం ౧ మొదటి\nసారాంశం\n## అధ్యాయం ౨ రెండవ\nసారాంశం"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_telugu_prose_is_not_a_chapter_heading(self):
+        """An inflected form (అధ్యాయంలో) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ఈ అధ్యాయంలో మనం చర్చిస్తాము") is None
+        assert _chapter_number("అధ్యాయం") is None
+
+    def test_detects_kannada_chapters(self):
+        """Kannada headings: `ಅಧ್ಯಾಯ N`, Kannada or Arabic digits."""
+        text = (
+            "ಅಧ್ಯಾಯ ೧ ಪರಿಚಯ\nಸಾರಾಂಶ\n"
+            "ಅಧ್ಯಾಯ ೨ ವಿಧಾನಗಳು\nಸಾರಾಂಶ\n"
+            "ಅಧ್ಯಾಯ 3 ಫಲಿತಾಂಶಗಳು\nಸಾರಾಂಶ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_kannada_markdown_prefix(self):
+        text = "## ಅಧ್ಯಾಯ ೧ ಮೊದಲನೆಯ\nಸಾರಾಂಶ\n## ಅಧ್ಯಾಯ ೨ ಎರಡನೆಯ\nಸಾರಾಂಶ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_kannada_prose_is_not_a_chapter_heading(self):
+        """An inflected form (ಅಧ್ಯಾಯದಲ್ಲಿ) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ಈ ಅಧ್ಯಾಯದಲ್ಲಿ ನಾವು ಚರ್ಚಿಸುತ್ತೇವೆ") is None
+        assert _chapter_number("ಅಧ್ಯಾಯ") is None
+
+    def test_detects_malayalam_chapters(self):
+        """Malayalam headings: both spellings (അധ്യായം/അദ്ധ്യായം), Malayalam or Arabic digits."""
+        text = (
+            "അധ്യായം ൧ ആമുഖം\nസംഗ്രഹം\n"
+            "അദ്ധ്യായം ൨ രീതികൾ\nസംഗ്രഹം\n"
+            "അധ്യായം 3 ഫലങ്ങൾ\nസംഗ്രഹം"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_malayalam_markdown_prefix(self):
+        text = "## അധ്യായം ൧ ഒന്നാമത്തേത്\nസംഗ്രഹം\n## അദ്ധ്യായം ൨ രണ്ടാമത്തേത്\nസംഗ്രഹം"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_malayalam_prose_is_not_a_chapter_heading(self):
+        """An inflected form (അധ്യായത്തിൽ) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ഈ അധ്യായത്തിൽ നാം ചർച്ച ചെയ്യുന്നു") is None
+        assert _chapter_number("അധ്യായം") is None
+
+    def test_detects_gujarati_chapters(self):
+        """Gujarati headings: both words (પ્રકરણ/અધ્યાય), Gujarati or Arabic digits."""
+        text = (
+            "પ્રકરણ ૧ પરિચય\nસારાંશ\n"
+            "અધ્યાય ૨ પદ્ધતિઓ\nસારાંશ\n"
+            "પ્રકરણ 3 પરિણામો\nસારાંશ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_gujarati_markdown_prefix(self):
+        text = "## પ્રકરણ ૧ પહેલું\nસારાંશ\n## અધ્યાય ૨ બીજું\nસારાંશ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_gujarati_prose_is_not_a_chapter_heading(self):
+        """Inflected forms (પ્રકરણમાં/અધ્યાયમાં) and bare words are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("આ પ્રકરણમાં આપણે ચર્ચા કરીશું") is None
+        assert _chapter_number("આ અધ્યાયમાં આપણે ચર્ચા કરીશું") is None
+        assert _chapter_number("પ્રકરણ") is None
+        assert _chapter_number("અધ્યાય") is None
+
+    def test_detects_punjabi_chapters(self):
+        """Punjabi headings: both words (ਕਾਂਡ/ਅਧਿਆਇ), Gurmukhi or Arabic digits."""
+        text = (
+            "ਕਾਂਡ ੧ ਜਾਣ-ਪਛਾਣ\nਸਾਰ\n"
+            "ਅਧਿਆਇ ੨ ਢੰਗ\nਸਾਰ\n"
+            "ਕਾਂਡ 3 ਨਤੀਜੇ\nਸਾਰ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_punjabi_markdown_prefix(self):
+        text = "## ਕਾਂਡ ੧ ਪਹਿਲਾ\nਸਾਰ\n## ਅਧਿਆਇ ੨ ਦੂਜਾ\nਸਾਰ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_punjabi_prose_is_not_a_chapter_heading(self):
+        """A postposition phrase, an oblique form, or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ਇਸ ਕਾਂਡ ਵਿੱਚ ਅਸੀਂ ਚਰਚਾ ਕਰਾਂਗੇ") is None
+        assert _chapter_number("ਇਸ ਅਧਿਆਇ ਵਿੱਚ ਅਸੀਂ ਚਰਚਾ ਕਰਾਂਗੇ") is None
+        assert _chapter_number("ਸਾਰੇ ਕਾਂਡਾਂ ਦੀ ਸੂਚੀ") is None
+        assert _chapter_number("ਕਾਂਡ") is None
+        assert _chapter_number("ਅਧਿਆਇ") is None
+
+    def test_punjabi_does_not_collide_with_neighbouring_scripts(self):
+        """Gurmukhi (U+0A00–0A7F), Gujarati (U+0A80–0AFF) and Devanagari stay separate."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ਅਧਿਆਇ ੫") == 5
+        assert _chapter_number("અધ્યાય ૫") == 5
+        assert _chapter_number("अध्याय ५") == 5
+
+    def test_gujarati_adhyay_does_not_collide_with_hindi(self):
+        """Gujarati અધ્યાય (U+0A85…) and Devanagari अध्याय (U+0905…) are distinct."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("અધ્યાય ૫") == 5
+        assert _chapter_number("अध्याय ५") == 5
+
+    def test_detects_russian_chapters(self):
+        """Russian headings: `Глава N`, case-insensitive, with Arabic digits."""
+        text = (
+            "Глава 1 Введение\nсодержание\n"
+            "ГЛАВА 2 Методы\nсодержание\n"
+            "Глава 3 Результаты\nсодержание"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_russian_markdown_prefix(self):
+        text = "## Глава 1 Первая\nсодержание\n## Глава 2 Вторая\nсодержание"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_russian_prose_is_not_a_chapter_heading(self):
+        """An inflected form or a different word (Главная) is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("В этой главе мы обсудим") is None
+        assert _chapter_number("Главная страница") is None
+        assert _chapter_number("Глава") is None
+
+    def test_detects_greek_chapters(self):
+        """Greek headings: `Κεφάλαιο N`, incl. all-caps (accent-dropped) ΚΕΦΑΛΑΙΟ."""
+        text = (
+            "Κεφάλαιο 1 Εισαγωγή\nπεριεχόμενο\n"
+            "ΚΕΦΑΛΑΙΟ 2 Μέθοδοι\nπεριεχόμενο\n"
+            "Κεφάλαιο 3 Αποτελέσματα\nπεριεχόμενο"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_greek_markdown_prefix(self):
+        text = "## Κεφάλαιο 1 Πρώτο\nπεριεχόμενο\n## Κεφάλαιο 2 Δεύτερο\nπεριεχόμενο"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_greek_prose_is_not_a_chapter_heading(self):
+        """`κεφάλαιο` used in prose (no number, or mid-sentence) is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("Σε αυτό το κεφάλαιο θα δούμε") is None
+        assert _chapter_number("Κεφάλαιο") is None
+
+    def test_detects_hebrew_chapters(self):
+        """Hebrew headings: `פרק N`, with Arabic digits."""
+        text = (
+            "פרק 1 מבוא\nתקציר\n"
+            "פרק 2 שיטות\nתקציר\n"
+            "פרק 3 תוצאות\nתקציר"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_hebrew_markdown_prefix(self):
+        text = "## פרק 1 ראשון\nתקציר\n## פרק 2 שני\nתקציר"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_hebrew_prose_is_not_a_chapter_heading(self):
+        """Plural/prefixed forms and the bare word are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("בפרק זה נדון בנושא") is None
+        assert _chapter_number("פרקים רבים בספר") is None
+        assert _chapter_number("פרק") is None
+
+    def test_detects_armenian_chapters(self):
+        """Armenian headings: `Գլուխ N`, incl. all-caps ԳԼՈՒԽ and lowercase."""
+        text = (
+            "Գլուխ 1 Ներածություն\nամփոփում\n"
+            "ԳԼՈՒԽ 2 Մեթոդներ\nամփոփում\n"
+            "գլուխ 3 Արդյունքներ\nամփոփում"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_armenian_markdown_prefix(self):
+        text = "## Գլուխ 1 Առաջին\nամփոփում\n## Գլուխ 2 Երկրորդ\nամփոփում"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_armenian_prose_is_not_a_chapter_heading(self):
+        """The bare word, an inflected stem, and the plural+number are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("Գլուխ") is None
+        assert _chapter_number("այս գլխում we քննարկում ենք") is None
+        # Plural "Գլուխներ 5" ("chapters 5") must not read as chapter 5: the
+        # word has to be followed by whitespace, not more letters.
+        assert _chapter_number("Գլուխներ 5") is None
+
+    def test_detects_georgian_chapters(self):
+        """Georgian headings: `თავი N`, incl. all-caps Mtavruli ᲗᲐᲕᲘ."""
+        text = (
+            "თავი 1 შესავალი\nრეზიუმე\n"
+            "ᲗᲐᲕᲘ 2 მეთოდები\nრეზიუმე\n"
+            "თავი 3 შედეგები\nრეზიუმე"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_georgian_markdown_prefix(self):
+        text = "## თავი 1 პირველი\nრეზიუმე\n## თავი 2 მეორე\nრეზიუმე"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_georgian_prose_is_not_a_chapter_heading(self):
+        """The bare word, an inflected form, and the plural+number are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("თავი") is None
+        assert _chapter_number("ამ თავში განვიხილავთ") is None
+        # Plural "თავები 5" ("chapters 5") must not read as chapter 5.
+        assert _chapter_number("თავები 5") is None
+
+    def test_hebrew_heading_survives_bidi_controls(self):
+        """Bidi wrappers are stripped before detection, so the heading still counts."""
+        from book_to_skill.sanitize import sanitize_extracted_text
+
+        text = "\u202bפרק 1 מבוא\u202c\nתקציר\n\u202bפרק 2 שיטות\u202c\nתקציר"
+        sanitized, removed = sanitize_extracted_text(text)
+        assert removed == 4
+        assert detect_structure(sanitized)["chapters_detected"] == 2
 
     # ── Korean chapter headings ────────────────────────────────────────────
 
@@ -672,6 +1063,260 @@ class TestDetectStructure:
         text = "제1편 총칙\n내용\n제2장 정의\n내용\n제3절 통칙\n내용"
         assert detect_structure(text)["chapters_detected"] == 3
 
+    # ── Persian chapter headings ───────────────────────────────────────────
+
+    # Canonical ordinals 1–34 used by the FA word-numeral map (integration fixture).
+    _FA_ORDINAL_1_TO_34 = (
+        "اول", "دوم", "سوم", "چهارم", "پنجم", "ششم", "هفتم", "هشتم", "نهم", "دهم",
+        "یازدهم", "دوازدهم", "سیزدهم", "چهاردهم", "پانزدهم", "شانزدهم", "هفدهم",
+        "هجدهم", "نوزدهم", "بیستم",
+        "بیست و یکم", "بیست و دوم", "بیست و سوم", "بیست و چهارم", "بیست و پنجم",
+        "بیست و ششم", "بیست و هفتم", "بیست و هشتم", "بیست و نهم", "سی ام",
+        "سی و یکم", "سی و دوم", "سی و سوم", "سی و چهارم",
+    )
+
+    def test_persian_digit_scripts(self):
+        """`فصل N` with Persian, Arabic-Indic, and ASCII digits."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل ۱") == 1
+        assert _chapter_number("فصل ١") == 1
+        assert _chapter_number("فصل 1") == 1
+        assert _chapter_number("فصل ۱۰") == 10
+        assert _chapter_number("فصل ١٠") == 10
+        assert _chapter_number("فصل 10") == 10
+        assert _chapter_number("فصل ۳۴") == 34
+
+    def test_persian_word_numerals_1_to_34(self):
+        """Word ordinals `اول` … `سی و چهارم` map to integers 1–34."""
+        from book_to_skill.utils import _chapter_number
+
+        detected = list(map(lambda word: _chapter_number(f"فصل {word}"), self._FA_ORDINAL_1_TO_34))
+        assert detected == list(range(1, 35))
+        # Common ZWNJ spelling of 30.
+        assert _chapter_number("فصل سی‌ام") == 30
+
+    def test_persian_zwnj_ordinal_survives_sanitization(self):
+        """The ZWNJ spelling of 30 must still resolve after U+200C is stripped.
+
+        sanitize_extracted_text() removes U+200C (a prompt-injection spacer)
+        before detect_structure() runs, so asserting on the raw heading alone
+        passes while the real pipeline misses the chapter.
+        """
+        from book_to_skill.sanitize import sanitize_extracted_text
+        from book_to_skill.utils import _chapter_number
+
+        heading = "فصل سی‌ام"
+        sanitized, removed = sanitize_extracted_text(heading)
+        assert removed == 1
+        assert sanitized != heading
+        assert _chapter_number(sanitized) == 30
+
+    def test_persian_zwnj_chapter_detected_end_to_end(self):
+        """A ZWNJ-spelled Persian heading is counted after sanitization."""
+        from book_to_skill.sanitize import sanitize_extracted_text
+
+        text = (
+            "فصل بیستم مقدمه\nمتن\n"
+            "فصل سی‌ام نتیجه\nمتن"
+        )
+        sanitized, _ = sanitize_extracted_text(text)
+        assert detect_structure(sanitized)["chapters_detected"] == 2
+
+    def test_persian_compound_word_numerals(self):
+        """Explicit compound forms used in longer Persian books."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل بیست و یکم") == 21
+        assert _chapter_number("فصل بیست و نهم") == 29
+        assert _chapter_number("فصل سی و یکم") == 31
+        assert _chapter_number("فصل سی و چهارم") == 34
+
+    def test_persian_hejdahom_spelling_variants(self):
+        """Both common spellings of 18: هجدهم and هیجدهم."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل هجدهم") == 18
+        assert _chapter_number("فصل هجدهم: یک جاسوس") == 18
+        assert _chapter_number("فصل هیجدهم") == 18
+        assert _chapter_number("فصل هیجدهم: یک جاسوس") == 18
+
+    def test_persian_bakhsh_section(self):
+        """`بخش` (section/part) is accepted with digits or word numerals."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("بخش ۲") == 2
+        assert _chapter_number("بخش ٢") == 2
+        assert _chapter_number("بخش 2") == 2
+        assert _chapter_number("بخش دوم") == 2
+        assert _chapter_number("بخش سی و چهارم") == 34
+
+    def test_persian_titled_headings(self):
+        """Punctuation / dash / spaced titles after the numeral are headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل ۱: مقدمه") == 1
+        assert _chapter_number("فصل اول — مبانی برنامه‌نویسی") == 1
+        assert _chapter_number("فصل ۲. اصول") == 2
+        assert _chapter_number("بخش ۳: مفاهیم") == 3
+        assert _chapter_number("فصل بیست و یکم پایان سفر") == 21
+
+    def test_persian_markdown_prefix(self):
+        """Markdown heading prefixes are stripped by `_chapter_number`."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("## فصل ۱: مقدمه") == 1
+        assert _chapter_number("### فصل دوم") == 2
+        assert _chapter_number("### فصل سی و چهارم خداحافظ فرانسه") == 34
+
+    def test_persian_pdf_glued_title(self):
+        """PDF glue is allowed after teens/compounds, not after short 1–10 ordinals.
+
+        Short ordinals are plausible prefixes of ordinary Persian words
+        ("اولویت‌ها", "اولیه", "دومینو"), so they require a separator. Longer
+        forms are not, and extractors do drop the space after them.
+        """
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل سی و چهارمخداحافظ، فرانسه") == 34
+        assert _chapter_number("فصل بیست و یکمپایان سفر") == 21
+        assert _chapter_number("فصل هجدهمیک جاسوس") == 18
+        assert _chapter_number("فصل هیجدهمیک جاسوس") == 18
+        # Short 1–10 glued titles are rejected (see false-positive test below).
+        assert _chapter_number("فصل اولجایی که به نظر میرسید...") is None
+        assert _chapter_number("فصل دومشهادت یک جنایتکار علیه خودش") is None
+        assert _chapter_number("فصل سومعدالت") is None
+
+    def test_persian_short_ordinal_false_positives(self):
+        """Ordinary phrases that begin with a short ordinal must not be chapters."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("فصل اولویت‌ها") is None
+        assert _chapter_number("فصل اولیه") is None
+        assert _chapter_number("فصل دومینو") is None
+        assert _chapter_number("فصل سومین") is None
+
+    def test_persian_prose_is_not_a_chapter_heading(self):
+        """Inline / incomplete `فصل` references must not count as headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("در فصل ۲ این موضوع را بررسی می‌کنیم") is None
+        assert _chapter_number("در فصل دوم این موضوع را بررسی می‌کنیم") is None
+        assert _chapter_number("این فصل اول یک توضیح است") is None
+        assert _chapter_number("فصل") is None
+        assert _chapter_number("بخش") is None
+        # Incomplete compounds are not headings.
+        assert _chapter_number("فصل بیست") is None
+        assert _chapter_number("فصل سی و") is None
+        # Existing hard length guard in `_match_chapter_number`.
+        assert _chapter_number("فصل ۱: " + ("الف" * 40)) is None
+
+    def test_detects_persian_chapters(self):
+        """Plain-text Persian headings are numeric chapters, not MD fallback."""
+        text = "فصل ۱\nمحتوا\nفصل ۲\nمحتوا\nفصل ۳\nمحتوا"
+        result = detect_structure(text)
+        assert result["chapters_detected"] == 3
+        # Non-empty sample proves the numeric path, not structural Markdown.
+        assert result["chapter_headings_sample"] == ["فصل ۱", "فصل ۲", "فصل ۳"]
+
+    def test_detects_persian_word_chapters_1_to_34(self):
+        """All 34 word-numeral headings count as distinct numeric chapters."""
+        text = "\n".join(
+            starmap(
+                "فصل {}\nمحتوا فصل {}.".format,
+                zip(self._FA_ORDINAL_1_TO_34, range(1, 35)),
+            )
+        )
+        result = detect_structure(text)
+        assert result["chapters_detected"] == 34
+        assert result["chapter_headings_sample"]  # numeric path, not MD fallback
+        assert result["chapter_headings_sample"][0] == "فصل اول"
+
+    # ── Arabic chapter headings ───────────────────────────────────
+
+    # Ordinals 1–20 as Arabic books actually spell them — with the hamza (الأول),
+    # which only resolves because _AR_FOLD normalizes it to the table's الاول.
+    _AR_ORDINAL_1_TO_20 = (
+        "الأول", "الثاني", "الثالث", "الرابع", "الخامس",
+        "السادس", "السابع", "الثامن", "التاسع", "العاشر",
+        "الحادي عشر", "الثاني عشر", "الثالث عشر", "الرابع عشر",
+        "الخامس عشر", "السادس عشر", "السابع عشر", "الثامن عشر",
+        "التاسع عشر", "العشرون",
+    )
+
+    def test_arabic_definite_article_digits(self):
+        """`الفصل N` — the article is what the Persian label did not accept."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("الفصل 1") == 1
+        assert _chapter_number("الفصل ١") == 1
+        assert _chapter_number("الفصل ۱") == 1
+        assert _chapter_number("الفصل ١٠") == 10
+        assert _chapter_number("## الفصل ٣") == 3
+
+    def test_arabic_bab_chapter_word(self):
+        """باب / الباب (“gate”) titles chapters in classical and religious works."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("باب ٢") == 2
+        assert _chapter_number("الباب 3") == 3
+        assert _chapter_number("الباب الأول") == 1
+
+    def test_arabic_word_ordinals_1_to_20(self):
+        """Word ordinals `الأول` … `العشرون` map to integers 1–20."""
+        from book_to_skill.utils import _chapter_number
+
+        detected = [_chapter_number(f"الفصل {w}") for w in self._AR_ORDINAL_1_TO_20]
+        assert detected == list(range(1, 21))
+
+    def test_arabic_spelling_variants_fold_to_one_entry(self):
+        """Hamza (أ/إ/آ) and alef maqsura (ى) spellings resolve to the same number."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("الفصل الأول") == 1
+        assert _chapter_number("الفصل الاول") == 1
+        # العشرين is the oblique form of العشرون; both head chapter 20.
+        assert _chapter_number("الفصل العشرون") == 20
+        assert _chapter_number("الفصل العشرين") == 20
+
+    def test_arabic_titled_heading(self):
+        """A title after the ordinal or digit is still a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("الفصل الثاني: المفاهيم") == 2
+        assert _chapter_number("الفصل ٤ — المقدمة") == 4
+
+    def test_arabic_prose_is_not_a_chapter_heading(self):
+        """Inline references and words that merely start with an ordinal stay rejected."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("في الفصل الثالث ذكرنا") is None
+        # الأولى (fem.) and الأولوية (“priority”) merely start with الأول.
+        assert _chapter_number("الفصل الأولى من السنة") is None
+        assert _chapter_number("الفصل الأولوية") is None
+        # الفصلية / بابا are different words, not a label plus a number.
+        assert _chapter_number("الفصلية 3") is None
+        assert _chapter_number("بابا ذهب") is None
+        # Years are outside the 1–99 guard.
+        assert _chapter_number("الفصل 2025") is None
+
+    def test_arabic_fold_leaves_persian_ordinals_intact(self):
+        """The Arabic fold must not reach Persian: ی (U+06CC) ≠ ي (U+064A)."""
+        from book_to_skill.utils import _AR_FOLD, _FA_ONES, _FA_TEENS, _chapter_number
+
+        folded = {c for w in _FA_ONES + _FA_TEENS for c in w} & set(map(chr, _AR_FOLD))
+        assert folded == set()
+        assert _chapter_number("فصل اول") == 1
+        assert _chapter_number("فصل بیست و یکم") == 21
+        assert _chapter_number("فصل اولیه") is None
+
+    def test_detects_arabic_chapters(self):
+        """Plain-text Arabic headings are numeric chapters, not MD fallback."""
+        text = "الفصل الأول\nمحتوى\nالفصل الثاني\nمحتوى\nالفصل ٣\nمحتوى"
+        result = detect_structure(text)
+        assert result["chapters_detected"] == 3
+        # Non-empty sample proves the numeric path, not structural Markdown.
+        assert result["chapter_headings_sample"] == ["الفصل الأول", "الفصل الثاني", "الفصل ٣"]
 
     def test_roman_footnote_reference_is_not_a_chapter(self):
         """Scholarly cross-references must stay rejected after the Roman change."""
@@ -712,8 +1357,16 @@ class TestDetectStructure:
     def test_toc_spanish_accented(self):
         assert detect_structure("Índice\n1 Introducción")["has_toc"] is True
 
+    def test_toc_portuguese_unaccented(self):
+        # OCR / accent-stripped Brazilian PDFs leave "Sumario" without the accent.
+        assert detect_structure("Sumario\n1 Introdução")["has_toc"] is True
+
     def test_toc_traditional_chinese(self):
         assert detect_structure("目錄\n第一章")["has_toc"] is True
+
+    @pytest.mark.parametrize("header", ["目 录", "目　录", "目 次", "目　次"])
+    def test_toc_cjk_headers_allow_extracted_whitespace(self, header):
+        assert detect_structure(f"{header}\n第一章 开始\n第二章 进阶")["has_toc"] is True
 
     def test_toc_italian_sommario(self):
         assert detect_structure("Sommario\n1 Introduzione")["has_toc"] is True
@@ -722,6 +1375,52 @@ class TestDetectStructure:
         # "contents"/"index" mid-sentence must not be mistaken for a ToC header
         text = "The contents of this chapter are varied and the index is long.\n"
         assert detect_structure(text)["has_toc"] is False
+
+    def test_toc_markdown_atx_heading(self):
+        # issue #126: a Markdown export writes the ToC as "## Table of Contents"
+        text = """## Table of Contents
+1. Intro
+2. Body
+"""
+        assert detect_structure(text)["has_toc"] is True
+
+    def test_toc_markdown_headers_other_languages(self):
+        text = """## 目录
+第一章 开始
+第二章 进阶
+"""
+        assert detect_structure(text)["has_toc"] is True
+
+    def test_unit_style_chapter_headings(self):
+        # course-style books: "### Unit 1 ✏ ..." must be detected as chapters
+        text = """### Unit 1 ✏ How to Write an Introduction
+body
+### Unit 2 ✏ Writing about Methodology
+body
+"""
+        assert detect_structure(text)["chapters_detected"] >= 2
+
+    def test_stray_roman_numeral_does_not_suppress_structural_count(self):
+        # a single Roman numeral inside a reproduced example paper must not
+        # outvote the structural heading count of the surrounding book
+        text = """### Introduction
+VIII. CONCLUSIONS
+### Methodology
+"""
+        result = detect_structure(text)
+        assert result["chapters_detected"] >= 2
+        assert result["chapters_method"] == "structural"
+
+    def test_unit_style_headings_count_as_numeric(self):
+        # "Unit N" headings are explicit chapters once the markdown prefix is
+        # stripped, so they take the numeric branch
+        text = """### Unit 1 ✏ How to Write an Introduction
+VIII. CONCLUSIONS
+### Unit 2 ✏ Writing about Methodology
+"""
+        result = detect_structure(text)
+        assert result["chapters_detected"] >= 2
+        assert result["chapters_method"] == "numeric" 
 
     def test_numbered_list_items_are_not_chapters(self):
         # The AI-Engineering failure: numbered list items were counted as chapters.
@@ -750,6 +1449,24 @@ class TestDetectStructure:
     def test_portuguese_capitulo(self):
         text = "Capítulo 1\nalgum texto\nCapítulo 2\nmais texto\n"
         assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_detects_plain_numbered_chapter_headings(self):
+        """Plain numbered headings such as '1  Introduction' are chapters."""
+        text = (
+            "1  Introdução e Visão Geral\n"
+            "Texto do capítulo.\n"
+            "2  Princípios Fundamentais\n"
+            "Texto do capítulo.\n"
+            "3  Produtos de Trabalho\n"
+            "Texto do capítulo.\n"
+            "4  Práticas para Elaboração\n"
+            "Texto do capítulo.\n"
+        )
+
+        result = detect_structure(text)
+
+        assert result["chapters_detected"] == 4
+        assert result["chapters_method"] == "numeric"
 
     def test_distinct_numbering_dedups_toc_and_body(self):
         # A ToC heading and the body heading for the same chapter count once.
@@ -863,6 +1580,33 @@ class TestDetectStructure:
         assert _cn_numeral_to_int("不是数字") is None
         assert _cn_numeral_to_int("9999") is None  # out of 1..999 chapter range
 
+    # ── Kangxi-radical numerals (U+2F00 block) ──────────────────────────────
+    # Some Chinese ebooks (e.g. certain e-reader platforms) encode numerals as
+    # Kangxi radicals instead of CJK ideographs: 第⼀章 with U+2F00, not U+4E00.
+    # NFKC does not map these, so detection must normalize them explicitly.
+
+    def test_kangxi_radical_chapter_headings(self):
+        text = (
+            "第⼀章\n正文\n"      # U+2F00 KANGXI RADICAL ONE
+            "第⼆章\n正文\n"      # U+2F06 KANGXI RADICAL TWO
+            "第⼋章\n正文\n"      # U+2F0B KANGXI RADICAL EIGHT
+            "第⼗章\n正文\n"      # U+2F17 KANGXI RADICAL TEN
+            "第⼗⼀章\n正文\n"    # ⼗⼀ = 11
+            "第⼗⼆章\n正文\n"    # ⼗⼆ = 12
+        )
+        assert detect_structure(text)["chapters_detected"] == 6
+
+    def test_kangxi_mixed_with_ideograph_chapters(self):
+        # Real-world mix from an actual ebook: radicals for 一/二/八/十,
+        # ideographs for the rest — all 12 chapters must be found.
+        nums = ["⼀", "⼆", "三", "四", "五", "六", "七", "⼋", "九", "⼗", "⼗⼀", "⼗⼆"]
+        text = "".join(f"第{n}章\n正文。\n" for n in nums)
+        assert detect_structure(text)["chapters_detected"] == 12
+
+    def test_kangxi_radical_in_markdown_heading(self):
+        text = "## 第⼀讲\n正文\n## 第⼆讲\n正文\n"
+        assert detect_structure(text)["chapters_detected"] == 2
+
     def test_french_chapitre(self):
         assert detect_structure("Chapitre 1\nx\nChapitre 2\nx")["chapters_detected"] == 2
 
@@ -874,6 +1618,16 @@ class TestDetectStructure:
 
     def test_dutch_hoofdstuk(self):
         assert detect_structure("Hoofdstuk 1\nx\nHoofdstuk 2\nx")["chapters_detected"] == 2
+
+    def test_vietnamese_chuong(self):
+        assert detect_structure("Chương 1\nx\nChương 2\nx")["chapters_detected"] == 2
+
+    def test_vietnamese_chuong_not_program(self):
+        # "Chương trình" (program) starts with the chapter word but is not a
+        # heading — no number follows "Chương", so it must not match.
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("Chương trình 1 của khóa học") is None
 
     def test_german_kapitel_with_title(self):
         text = "Kapitel 1: Einführung\nx\nKapitel 2: Methoden\nx"
@@ -1048,7 +1802,40 @@ class TestHtmlExtraction:
 
 
 class TestDocxExtraction:
-    """Tests for DOCX extraction via the zipfile fallback."""
+    """Tests for the preferred python-docx parser and the stdlib fallback."""
+
+    def test_extract_docx_python_docx_preserves_document_order(self, tmp_path):
+        from types import SimpleNamespace
+
+        from book_to_skill.parsers.docx import extract_docx_with_python_docx
+
+        docx_path = _make_minimal_docx(tmp_path / "interleaved.docx")
+        document = mock.Mock()
+        document.iter_inner_content.return_value = [
+            SimpleNamespace(text="Chapter 1: Validation"),
+            SimpleNamespace(
+                rows=[
+                    SimpleNamespace(
+                        cells=[
+                            SimpleNamespace(text="CH1_RULE"),
+                            SimpleNamespace(text="Reject negative balances."),
+                        ]
+                    )
+                ]
+            ),
+            SimpleNamespace(text="Chapter 2: Settlement"),
+        ]
+        python_docx = mock.Mock()
+        python_docx.Document.return_value = document
+
+        with mock.patch.dict(sys.modules, {"docx": python_docx}):
+            result = extract_docx_with_python_docx(str(docx_path))
+
+        assert result == (
+            "Chapter 1: Validation\n"
+            "CH1_RULE\tReject negative balances.\n"
+            "Chapter 2: Settlement"
+        )
 
     def test_extract_docx_zipfile_fallback(self, tmp_path):
         docx = _make_minimal_docx(tmp_path / "test.docx")
@@ -1058,6 +1845,78 @@ class TestDocxExtraction:
 
         assert result["format"] == "docx"
         assert "DOCX test paragraph" in result["text"]
+
+    def test_extract_docx_zipfile_xxe_rejection_direct_call(self, tmp_path):
+        """extract_docx_with_zipfile() must reject malicious XML even when
+        called directly, not just via the extract_docx() wrapper — this is
+        the bypass the self-defending validate_docx_xml_safety() call closes."""
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        xml = textwrap.dedent(f"""\
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <!DOCTYPE w:document [
+              <!ENTITY xxe SYSTEM "file:///etc/passwd">
+            ]>
+            <w:document xmlns:w="{ns}">
+              <w:body>
+                <w:p><w:r><w:t>&xxe;</w:t></w:r></w:p>
+              </w:body>
+            </w:document>
+        """)
+        bad_docx = tmp_path / "malicious.docx"
+        with zipfile.ZipFile(bad_docx, "w") as zf:
+            zf.writestr("word/document.xml", xml)
+            zf.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+
+        with pytest.raises(ExtractionError, match="Security validation failed"):
+            extract_docx_with_zipfile(str(bad_docx))
+
+    def test_extract_docx_python_docx_xxe_rejection_direct_call(self, tmp_path):
+        """extract_docx_with_python_docx() must reject malicious XML even when
+        called directly, not just via the extract_docx() wrapper — mirrors the
+        zipfile-parser test above. Validation now runs after `import docx`
+        succeeds (so an absent python-docx doesn't pay for a scan that never
+        protects anything -- see extract_docx_with_python_docx's docstring),
+        so `docx` is faked importable here to exercise the guard
+        deterministically regardless of whether python-docx is actually
+        installed in the environment running this test."""
+        from book_to_skill.parsers.docx import extract_docx_with_python_docx
+
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        xml = textwrap.dedent(f"""\
+            <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+            <!DOCTYPE w:document [
+              <!ENTITY xxe SYSTEM "file:///etc/passwd">
+            ]>
+            <w:document xmlns:w="{ns}">
+              <w:body>
+                <w:p><w:r><w:t>&xxe;</w:t></w:r></w:p>
+              </w:body>
+            </w:document>
+        """)
+        bad_docx = tmp_path / "malicious.docx"
+        with zipfile.ZipFile(bad_docx, "w") as zf:
+            zf.writestr("word/document.xml", xml)
+            zf.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+
+        with mock.patch.dict(sys.modules, {"docx": mock.MagicMock()}):
+            with pytest.raises(ExtractionError, match="Security validation failed"):
+                extract_docx_with_python_docx(str(bad_docx))
+
+    def test_extract_docx_python_docx_absent_skips_validation_without_raising(self, tmp_path):
+        """Companion to the test above: when python-docx genuinely isn't
+        importable, extract_docx_with_python_docx() must return None (not
+        raise, not scan the archive) -- it can't parse anything either way,
+        malicious or not, so there's no protection to buy by validating."""
+        from book_to_skill.parsers.docx import extract_docx_with_python_docx
+
+        docx_path = tmp_path / "whatever.docx"
+        docx_path.write_bytes(b"not even a real docx")
+
+        missing_docx = ImportError("simulated: python-docx not installed")
+        with mock.patch("builtins.__import__", side_effect=missing_docx):
+            result = extract_docx_with_python_docx(str(docx_path))
+
+        assert result is None
 
     def test_extract_docx_xxe_rejection(self, tmp_path):
         """Verify that a DOCX with malicious DTD or entity declarations is rejected."""
@@ -1084,10 +1943,41 @@ class TestDocxExtraction:
         with pytest.raises(ExtractionError, match="Security validation failed"):
             extract_docx(str(bad_docx))
 
+    def test_extract_docx_validates_once_when_python_docx_unavailable(self, tmp_path):
+        """Maintainer-requested regression test: validate_docx_xml_safety()
+        must run exactly once through extract_docx() when python-docx isn't
+        installed -- once for real in the zipfile fallback, not also
+        wastefully in the python-docx path before it ImportErrors out. That
+        double-scan (the whole archive, every .xml/.rels member, decoded
+        across five candidate encodings) is exactly what the earlier review
+        round asked to remove."""
+        from book_to_skill.parsers import docx as docx_module
+
+        docx_path = _make_minimal_docx(tmp_path / "test.docx")
+
+        with mock.patch.object(
+            docx_module,
+            "validate_docx_xml_safety",
+            wraps=docx_module.validate_docx_xml_safety,
+        ) as spy:
+            with mock.patch.dict(sys.modules, {"docx": None}):
+                text, method = docx_module.extract_docx(str(docx_path))
+
+        assert method == "zipfile-docx"
+        assert "DOCX test paragraph" in text
+        assert spy.call_count == 1
+
 
 
 class TestResolveInputFiles:
     """Additional edge-case tests for resolve_input_files."""
+
+    def test_existing_file_with_glob_metacharacters_is_literal(self, tmp_path):
+        target = _make_text_file(tmp_path / "book [2013].pdf")
+
+        result = resolve_input_files([str(target)])
+
+        assert result == [target.resolve()]
 
     def test_nonexistent_file_kept_for_error_reporting(self, tmp_path):
         """A nonexistent explicit path is kept so extract_single_file can report it."""
@@ -1144,7 +2034,7 @@ class TestDependencyCheck:
         # MOBI has no fallback → flagged as required
         assert "MISSING — required, no fallback" in out
         # Calibre hint is surfaced as a system dependency
-        assert "calibre-ebook.com" in out
+        assert "install Calibre: https://calibre-ebook.com/download" in out
 
     def test_pdftotext_alone_satisfies_pdf_text(self, capsys):
         """pdftotext present (system) should mark PDF text-heavy ready even with no python PDF libs."""
@@ -1177,14 +2067,10 @@ class TestParserExceptionLogging:
         broken = tmp_path / "broken.pdf"
         broken.write_bytes(b"%PDF-1.4 fake")
 
-        real_import = __import__
+        fake_pypdf = mock.MagicMock()
+        fake_pypdf.PdfReader.side_effect = RuntimeError("simulated failure")
 
-        def fake_import(name, *args, **kwargs):
-            if name == "pypdf":
-                raise RuntimeError("simulated failure")
-            return real_import(name, *args, **kwargs)
-
-        with mock.patch("builtins.__import__", side_effect=fake_import):
+        with mock.patch.dict(sys.modules, {"pypdf": fake_pypdf}):
             result = extract_with_pypdf(str(broken))
 
         assert result is None
@@ -1273,7 +2159,6 @@ class TestDocxTableReconstruction:
     _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
     def _make_docx(self, tmp_path, body_xml):
-        import zipfile
         p = tmp_path / "t.docx"
         doc = (
             '<?xml version="1.0"?>'
@@ -1313,6 +2198,22 @@ class TestDocxTableReconstruction:
         out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
         assert out == "Just a paragraph\nAnd another"
 
+    def test_inline_tabs_are_preserved(self, tmp_path):
+        body = (
+            "<w:p><w:r><w:t>Term</w:t><w:tab/><w:t>Definition</w:t>"
+            "</w:r></w:p>"
+        )
+        out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
+        assert out == "Term\tDefinition"
+
+    def test_inline_breaks_are_preserved(self, tmp_path):
+        body = (
+            "<w:p><w:r><w:t>First line</w:t><w:br/><w:t>Second line</w:t>"
+            "<w:cr/><w:t>Third line</w:t></w:r></w:p>"
+        )
+        out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
+        assert out == "First line\nSecond line\nThird line"
+
     def test_empty_cell_still_tab_joined(self, tmp_path):
         body = (
             "<w:tbl><w:tr>" + self._cell("A")
@@ -1333,6 +2234,127 @@ class TestDocxTableReconstruction:
         )
         out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
         assert out == "Before\nInside SDT\nAfter"
+
+    def test_dispatcher_uses_more_complete_output_for_sdt(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Before")
+            + "<w:sdt><w:sdtContent>" + self._para("Inside SDT") + "</w:sdtContent></w:sdt>"
+            + self._para("After")
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value="Before\nAfter",
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert method == "zipfile-docx"
+        assert text == "Before\nInside SDT\nAfter"
+
+    def test_dispatcher_prefers_sdt_coverage_over_longer_output(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Before")
+            + "<w:sdt><w:sdtContent>" + self._para("X") + "</w:sdtContent></w:sdt>"
+            + self._para("After")
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Before\n" + "long ordinary paragraph " * 20 + "\nAfter"
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Before\nX\nAfter"
+
+    def test_dispatcher_does_not_match_sdt_paragraph_inside_another_paragraph(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Chapter 10")
+            + "<w:sdt><w:sdtContent>" + self._para("1") + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Chapter 10\n" + "long ordinary paragraph " * 20
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Chapter 10\n1"
+
+    def test_dispatcher_counts_repeated_sdt_paragraphs(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            "<w:sdt><w:sdtContent>"
+            + self._para("Repeated")
+            + self._para("Repeated")
+            + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Repeated\n" + "long ordinary paragraph " * 20
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Repeated\nRepeated"
+
+    def test_dispatcher_keeps_preferred_when_fallback_adds_no_sdt_coverage(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("ordinary paragraph " * 20)
+            + "<w:sdt><w:sdtContent>" + self._para("Inside SDT") + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Inside SDT"
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(docx_parser.extract_docx_with_zipfile(docx_path)) > len(preferred)
+        assert method == "python-docx"
+        assert text == preferred
+
+    def test_dispatcher_keeps_preferred_parser_without_sdt(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        docx_path = self._make_docx(tmp_path, self._para("Ordinary document"))
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value="Preferred parser output",
+        ), mock.patch.object(
+            docx_parser,
+            "extract_docx_with_zipfile",
+            wraps=docx_parser.extract_docx_with_zipfile,
+        ) as fallback:
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert method == "python-docx"
+        assert text == "Preferred parser output"
+        fallback.assert_not_called()
 
 
 class TestEpubSpineOrder:
@@ -1367,6 +2389,32 @@ class TestEpubSpineOrder:
         files = {"ch1.xhtml": self._doc("FIRST"), "ch2.xhtml": self._doc("SECOND")}
         out = extract_with_zipfile(self._make_epub(tmp_path, opf, files))
         assert out.index("FIRST") < out.index("SECOND")
+
+    def test_prefixed_opf_elements_preserve_spine_order_and_count(self, tmp_path):
+        # XML namespace prefixes are semantically equivalent to the default OPF
+        # namespace. File names deliberately sort opposite to the spine so a
+        # missed prefixed manifest/spine cannot pass through the sorted fallback.
+        opf = (
+            '<opf:package xmlns:opf="http://www.idpf.org/2007/opf" version="3.0">'
+            '<opf:manifest>'
+            '<opf:item id="c1" href="z-first.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '<opf:item id="c2" href="a-second.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '</opf:manifest><opf:spine>'
+            '<opf:itemref idref="c1"/><opf:itemref idref="c2"/>'
+            '</opf:spine></opf:package>'
+        )
+        files = {
+            "z-first.xhtml": self._doc("FIRST"),
+            "a-second.xhtml": self._doc("SECOND"),
+        }
+        epub_path = self._make_epub(tmp_path, opf, files)
+
+        out = extract_with_zipfile(epub_path)
+
+        assert out.index("FIRST") < out.index("SECOND")
+        assert count_epub_chapters(epub_path) == 2
 
     def test_non_spine_doc_kept_as_safety_net_after_spine(self, tmp_path):
         opf = (
@@ -1413,6 +2461,30 @@ class TestEpubSpineOrder:
         )
         assert "SUBDIR" in out
 
+    def test_manifest_href_fragment_is_not_part_of_archive_name(self, tmp_path):
+        opf = (
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+            '<item id="c1" href="chapter.xhtml#section-2" '
+            'media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/></spine></package>'
+        )
+        files = {"chapter.xhtml": self._doc("FRAGMENT")}
+        out = extract_with_zipfile(self._make_epub(tmp_path, opf, files))
+        assert "FRAGMENT" in out
+
+    def test_manifest_href_percent_encoding_maps_to_archive_name(self, tmp_path):
+        opf = (
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+            '<item id="c1" href="Text/Chapter%201.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/></spine></package>'
+        )
+        files = {"OEBPS/Text/Chapter 1.xhtml": self._doc("ENCODED")}
+        out = extract_with_zipfile(
+            self._make_epub(tmp_path, opf, files, opf_name="OEBPS/content.opf")
+        )
+        assert "ENCODED" in out
+
     def test_non_self_closing_item_tag(self, tmp_path):
         # <item ...></item> (non-self-closing) is parsed via its opening tag.
         opf = (
@@ -1435,6 +2507,139 @@ class TestEpubSpineOrder:
         out = extract_with_zipfile(str(p))
         assert "AAA" in out and "BBB" in out
 
+
+def test_ebooklib_spine_order_without_optional_dependencies(monkeypatch):
+    """The preferred parser's spine logic runs in the dependency-free CI matrix."""
+    import types
+
+    from book_to_skill.parsers.epub import extract_with_ebooklib
+
+    item_document = 9
+
+    class FakeItem:
+        def __init__(self, item_id, content):
+            self.item_id = item_id
+            self.content = content
+
+        def get_type(self):
+            return item_document
+
+        def get_content(self):
+            return self.content
+
+    first = FakeItem("c1", "FIRST")
+    second = FakeItem("c2", "SECOND")
+    nav = FakeItem("nav", "NAVIGATION")
+
+    class FakeBook:
+        spine = [("c1", "yes"), ("c2", "yes")]
+
+        def __init__(self):
+            self.items = {item.item_id: item for item in (first, second, nav)}
+
+        def get_items_of_type(self, item_type):
+            assert item_type == item_document
+            # EPUB manifest order deliberately differs from the spine order.
+            return [second, first, nav]
+
+        def get_item_with_id(self, item_id):
+            return self.items.get(item_id)
+
+    book = FakeBook()
+
+    class FakeSoup:
+        def __init__(self, content, _parser):
+            self.content = content
+
+        def get_text(self, separator="\n"):
+            return self.content
+
+    ebooklib = types.ModuleType("ebooklib")
+    ebooklib.ITEM_DOCUMENT = item_document
+    epub = types.ModuleType("ebooklib.epub")
+    epub.read_epub = lambda _path: book
+    ebooklib.epub = epub
+    bs4 = types.ModuleType("bs4")
+    bs4.BeautifulSoup = FakeSoup
+    monkeypatch.setitem(sys.modules, "ebooklib", ebooklib)
+    monkeypatch.setitem(sys.modules, "ebooklib.epub", epub)
+    monkeypatch.setitem(sys.modules, "bs4", bs4)
+
+    text = extract_with_ebooklib("unused.epub")
+    assert text.index("FIRST") < text.index("SECOND") < text.index("NAVIGATION")
+
+    book.spine = [("c1", "yes"), ("missing", "yes"), ("c1", "yes")]
+    text_with_invalid_refs = extract_with_ebooklib("unused.epub")
+    assert text_with_invalid_refs.index("FIRST") < text_with_invalid_refs.index("SECOND")
+    assert text_with_invalid_refs.index("SECOND") < text_with_invalid_refs.index("NAVIGATION")
+    assert text_with_invalid_refs.count("FIRST") == 1
+
+
+class TestEbooklibEpubSpineOrder:
+    """The preferred EPUB extractor follows the OPF spine as well."""
+
+    def _make_book(self, epub, spine):
+        book = epub.EpubBook()
+        book.set_identifier("synthetic-spine-order")
+        book.set_title("Synthetic ordering fixture")
+        book.set_language("en")
+
+        first = epub.EpubHtml(title="Chapter 1", file_name="z-first.xhtml", uid="c1")
+        first.content = "<h1>Chapter 1</h1><p>FIRST: Define the calibration procedure.</p>"
+        second = epub.EpubHtml(title="Chapter 2", file_name="a-second.xhtml", uid="c2")
+        second.content = "<h1>Chapter 2</h1><p>SECOND: Apply the procedure defined earlier.</p>"
+        nav = epub.EpubNav(title="Navigation")
+        nav.content = "<html><body><p>NAVIGATION-MARKER</p></body></html>"
+
+        # This is also the valid fixture's manifest order. File names deliberately
+        # sort opposite to the reading order so archive/name order cannot pass.
+        book.add_item(second)
+        book.add_item(first)
+        book.add_item(nav)
+        book.spine = spine
+        book.toc = [first, second]
+        return book
+
+    def test_spine_order_overrides_manifest_order_and_nav_follows(self, tmp_path):
+        epub = pytest.importorskip("ebooklib.epub")
+        pytest.importorskip("bs4")
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        book = self._make_book(epub, [])
+        book.spine = [book.get_item_with_id("c1"), book.get_item_with_id("c2")]
+        epub_path = tmp_path / "spine-order.epub"
+        epub.write_epub(str(epub_path), book)
+
+        text = extract_with_ebooklib(str(epub_path))
+
+        assert text is not None
+        assert text.index("FIRST:") < text.index("SECOND:") < text.index("Navigation")
+
+    def test_missing_or_repeated_spine_refs_keep_documents_once(self, monkeypatch):
+        epub = pytest.importorskip("ebooklib.epub")
+        pytest.importorskip("bs4")
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        book = self._make_book(epub, [("c1", "yes"), ("missing", "yes"), ("c1", "yes")])
+        monkeypatch.setattr(epub, "read_epub", lambda _path: book)
+
+        text = extract_with_ebooklib("unused.epub")
+
+        assert text is not None
+        assert text.index("FIRST:") < text.index("SECOND:") < text.index("NAVIGATION-MARKER")
+        assert text.count("FIRST:") == 1
+        assert text.count("SECOND:") == 1
+        assert text.count("NAVIGATION-MARKER") == 1
+
+        book.spine = []
+        text_without_spine = extract_with_ebooklib("unused.epub")
+
+        assert text_without_spine is not None
+        assert text_without_spine.index("SECOND:") < text_without_spine.index("FIRST:")
+        assert text_without_spine.index("FIRST:") < text_without_spine.index("NAVIGATION-MARKER")
+        assert text_without_spine.count("FIRST:") == 1
+        assert text_without_spine.count("SECOND:") == 1
+        assert text_without_spine.count("NAVIGATION-MARKER") == 1
 
 class TestTextEncodingDetection:
     """read_text_file decodes UTF-16/UTF-32 by BOM, with a BOM-less fallback."""
@@ -1486,7 +2691,7 @@ class TestTextEncodingDetection:
 class TestPdftotextEncoding:
     """pdftotext output (UTF-8) is decoded as UTF-8, not the locale encoding."""
 
-    def test_pdftotext_decodes_as_utf8(self, monkeypatch):
+    def test_pdftotext_requests_utf8_output(self, monkeypatch):
         captured = {}
 
         class _Result:
@@ -1496,6 +2701,7 @@ class TestPdftotextEncoding:
         monkeypatch.setattr(pdf_parser.shutil, "which", lambda name: "/usr/bin/pdftotext")
 
         def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured.update(kwargs)
             return _Result()
 
@@ -1504,6 +2710,82 @@ class TestPdftotextEncoding:
         assert pdf_parser.extract_with_pdftotext("x.pdf") == "Café — naïve"
         assert captured.get("encoding") == "utf-8"
         assert captured.get("errors") == "replace"
+        cmd = captured.get("cmd") or []
+        assert "-enc" in cmd and cmd[cmd.index("-enc") + 1] == "UTF-8"
+
+
+class TestPdfPageCount:
+    """Tests for PDF page-count fallback behavior."""
+
+    def test_count_pages_uses_pdfminer_when_pdfinfo_and_pypdf_are_unavailable(
+        self, monkeypatch
+    ):
+        """Use pdfminer as the final fallback when other page counters are unavailable."""
+        fake_pdf = "fake.pdf"
+
+        monkeypatch.setattr(pdf_parser.shutil, "which", lambda _: None)
+
+        high_level = mock.MagicMock()
+        high_level.extract_text.return_value = (
+            "page one\fpage two\fpage three"
+        )
+
+        pdfminer = mock.MagicMock()
+        pdfminer.high_level = high_level
+
+        monkeypatch.setitem(sys.modules, "pdfminer", pdfminer)
+        monkeypatch.setitem(sys.modules, "pdfminer.high_level", high_level)
+
+        assert pdf_parser.count_pages(fake_pdf) == 3
+
+class TestLooksImageOnly:
+    """Scanned PDFs are caught by probing the first pages, before the chain runs."""
+
+    def _probe(self, monkeypatch, stdout, *, has_pdftotext=True):
+        captured = {}
+
+        class _Result:
+            returncode = 0
+
+        _Result.stdout = stdout
+        monkeypatch.setattr(
+            pdf_parser.shutil, "which",
+            lambda name: "/usr/bin/pdftotext" if has_pdftotext else None,
+        )
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _Result()
+
+        monkeypatch.setattr(pdf_parser.subprocess, "run", fake_run)
+        return captured
+
+    def test_no_text_in_first_pages_is_image_only(self, monkeypatch):
+        captured = self._probe(monkeypatch, "\n\f\n  \f")
+        assert pdf_parser.looks_image_only("scan.pdf") is True
+        # Only the first pages are probed, not the whole book.
+        assert "-l" in captured["cmd"] and captured["cmd"][captured["cmd"].index("-l") + 1] == "5"
+
+    def test_text_in_first_pages_is_not_image_only(self, monkeypatch):
+        self._probe(monkeypatch, "Chapter 1\nOnce upon a time")
+        assert pdf_parser.looks_image_only("book.pdf") is False
+
+    def test_without_pdftotext_probe_is_skipped(self, monkeypatch):
+        self._probe(monkeypatch, "", has_pdftotext=False)
+        assert pdf_parser.looks_image_only("scan.pdf") is False
+
+    def test_extraction_fails_early_with_ocr_hint(self, monkeypatch, tmp_path):
+        from book_to_skill import utils
+
+        pdf = tmp_path / "scan.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        monkeypatch.setattr(utils, "looks_image_only", lambda path: True)
+
+        with pytest.raises(ExtractionError) as exc:
+            utils.extract_single_file(pdf, "text", "no")
+
+        assert "scanned" in str(exc.value)
+        assert "ocrmypdf" in str(exc.value)
 
 
 class TestPdftotextCleanup:
@@ -1666,7 +2948,6 @@ class TestParseArgumentsUnknownFlags:
         captured = capsys.readouterr()
         assert captured.err == ""
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  CJK-aware token estimate (rescued from #70)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1688,3 +2969,95 @@ class TestCjkTokenEstimate:
 
     def test_empty_is_zero(self):
         assert estimate_tokens("") == 0
+
+    def test_kangxi_radicals_counted_as_cjk(self):
+        # Some Chinese ebooks render Han characters as Kangxi radicals
+        # throughout (网 as ⽹ U+2F79, 大 as ⼤ U+2F24, 一 as ⼀ U+2F00).
+        # A space-less run of them must not fall into the word branch.
+        assert estimate_tokens("⼀" * 1500) == 1000
+
+
+class TestPdfLibsCleanup:
+    """extract_with_pypdf / extract_with_pdfminer also clean their output."""
+
+    def test_pypdf_output_is_cleaned(self, monkeypatch):
+        pages = [f"HEAD\nsome informa-\ntion page {n}\n{n}" for n in (1, 2, 3)]
+
+        class _Page:
+            def __init__(self, t): self._t = t
+            def extract_text(self): return self._t
+
+        class _Reader:
+            def __init__(self, f): self.pages = [_Page(p) for p in pages]
+
+        import types
+        fake = types.SimpleNamespace(PdfReader=_Reader)
+        monkeypatch.setitem(sys.modules, "pypdf", fake)
+        monkeypatch.setattr("builtins.open", lambda *a, **k: mock.MagicMock())
+
+        out = pdf_parser.extract_with_pypdf("x.pdf")
+        assert "information" in out          # dehyphenated
+        assert "HEAD" not in out             # repeated header stripped
+
+    def test_pdfminer_output_is_cleaned(self, monkeypatch):
+        raw = "\f".join(f"HEAD\ncon-\ntent page {n}\n{n}" for n in (1, 2, 3))
+        import types
+        fake = types.SimpleNamespace(extract_text=lambda path: raw)
+        monkeypatch.setitem(sys.modules, "pdfminer.high_level", fake)
+
+        out = pdf_parser.extract_with_pdfminer("x.pdf")
+        assert "content" in out
+        assert "HEAD" not in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLI entry point tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCliEntryPoint:
+    """Tests for cli.py and __main__.py entry points."""
+
+    def test_cli_main_calls_utils_main(self):
+        """cli.main() should call utils.main()."""
+        from book_to_skill import cli
+        called = False
+        def fake_utils_main():
+            nonlocal called
+            called = True
+        with mock.patch("book_to_skill.cli.utils_main", side_effect=fake_utils_main):
+            cli.main()
+        assert called, "cli.main() should call utils.main()"
+
+    def test_cli_main_reconfigures_utf8(self):
+        """cli.main() should reconfigure stdout/stderr to UTF-8."""
+        from book_to_skill import cli
+        with mock.patch("book_to_skill.cli.utils_main"):
+            cli.main()
+        # After reconfigure, encoding should still be valid (may not change if already UTF-8)
+        assert sys.stdout.encoding is not None
+
+    def test_main_importable(self):
+        """__main__.py should be importable and call cli.main()."""
+        import importlib
+        spec = importlib.util.find_spec("book_to_skill.__main__")
+        assert spec is not None, "__main__ module should be findable"
+
+    def test_cli_main_returns_none(self):
+        """cli.main() is a procedure (implicitly returns None) and should complete without raising."""
+        from book_to_skill import cli
+        with mock.patch("book_to_skill.cli.utils_main"):
+            cli.main()
+
+    def test_cli_main_handles_reconfigure_failure(self):
+        """If reconfigure fails (mock stream), cli.main() should not crash."""
+        from book_to_skill import cli
+        class BrokenStream:
+            encoding = "ascii"
+            def reconfigure(self, **kwargs):
+                raise AttributeError("mock failure")
+        with mock.patch.object(cli, "sys") as mock_sys:
+            mock_sys.stdout = BrokenStream()
+            mock_sys.stderr = BrokenStream()
+            mock_sys.argv = ["extract.py"]
+            with mock.patch("book_to_skill.cli.utils_main"):
+                cli.main()  # should not raise
